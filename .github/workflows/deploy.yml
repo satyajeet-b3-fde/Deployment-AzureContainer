@@ -1,0 +1,133 @@
+name: Student AI Agent - Multi Environment CI/CD
+
+on:
+  workflow_dispatch: # manual trigger from the Actions tab
+  push:
+    branches: [develop]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: student-agent-release
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: student-support-agent
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -v
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: dev
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Build and push image (built once, promoted everywhere)
+        run: |
+          az acr build --registry "${{ vars.ACR_NAME }}" \
+            --image "${IMAGE_NAME}:${GITHUB_SHA}" .
+      - id: image
+        run: echo "image=${{ vars.ACR_NAME }}.azurecr.io/${IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+  deploy-dev:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy DEV
+        run: |
+          az containerapp update \
+            --name "${{ vars.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --image "${{ needs.build.outputs.image }}" \
+            --set-env-vars APP_VERSION="${GITHUB_SHA::7}"
+      - name: DEV health + AI smoke test
+        run: |
+          FQDN=$(az containerapp show \
+            --name "${{ vars.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          curl --fail --retry 12 --retry-delay 10 --retry-all-errors "https://${FQDN}/health"
+          curl --fail --retry 3 --retry-delay 10 --retry-all-errors -X POST "https://${FQDN}/ask" \
+            -H "Content-Type: application/json" -d '{"question":"Say hello in one short sentence."}'
+
+  deploy-preprod:
+    needs: [build, deploy-dev]
+    runs-on: ubuntu-latest
+    environment: preprod
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy PRE-PROD
+        run: |
+          az containerapp update \
+            --name "${{ vars.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --image "${{ needs.build.outputs.image }}" \
+            --set-env-vars APP_VERSION="${GITHUB_SHA::7}"
+      - name: PRE-PROD health + AI smoke test
+        run: |
+          FQDN=$(az containerapp show \
+            --name "${{ vars.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          curl --fail --retry 12 --retry-delay 10 --retry-all-errors "https://${FQDN}/health"
+          curl --fail --retry 3 --retry-delay 10 --retry-all-errors -X POST "https://${FQDN}/ask" \
+            -H "Content-Type: application/json" -d '{"question":"Say hello in one short sentence."}'
+
+  deploy-prod:
+    needs: [build, deploy-preprod]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy PROD
+        run: |
+          az containerapp update \
+            --name "${{ vars.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --image "${{ needs.build.outputs.image }}" \
+            --set-env-vars APP_VERSION="${GITHUB_SHA::7}"
+      - name: PROD health + AI smoke test
+        run: |
+          FQDN=$(az containerapp show \
+            --name "${{ vars.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          curl --fail --retry 12 --retry-delay 10 --retry-all-errors "https://${FQDN}/health"
+          curl --fail --retry 3 --retry-delay 10 --retry-all-errors -X POST "https://${FQDN}/ask" \
+            -H "Content-Type: application/json" -d '{"question":"Say hello in one short sentence."}'
